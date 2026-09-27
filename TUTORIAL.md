@@ -127,12 +127,23 @@ Get addicted to the daily habit.
 
 ---
 
-## 10. Cover Art
+## 10. Writing AI
+
+NEO’s optional Writing Assistant revises selected prose. Set it up deliberately under **File → Writing Assistant…**—NEO never asks during onboarding or sends text until you invoke Rewrite.
+
+- **Local AI** — a guided Ollama setup runs a model privately on your computer, with no account or key.
+- **API key** — OpenAI or another compatible service. Keys are stored encrypted, never in your library.
+
+Create a placeholder with `⌘⇧X` / `Ctrl+Shift+X`, describe it in the inline field, then later enter the final text and choose **Insert & resolve**. Select prose for the quiet **Rewrite** control, choose an editing direction, and preview the proposal before replacement.
+
+---
+
+## 11. Cover Art
 
 Every book gets a cover.
 
 - **New books** get a seeded abstract — six art styles, six type templates, typefaces bundled with NEO. No two stories look alike.
-- **Past 1,000 words** — NEO can read the text and paint a cover from it. Requires an OpenAI API key (paste it into *Goals & Settings*). About a penny a picture, generated in the background.
+- **Past 1,000 words** — NEO can read the text and paint a cover from it. Requires an OpenAI API key (paste it under *File → Cover Art…*). About a penny a picture, generated in the background.
 
 > These are for **writing inspiration only** — not publication. The API key is stored encrypted in NEO's settings, **never in your library folder**. The title and author are always set in real type, so lettering is never left to a gen-AI model.
 
@@ -140,7 +151,7 @@ Click `↻` on any book to re-roll type and colors, or repaint.
 
 ---
 
-## 11. Export
+## 12. Export
 
 **File → Export** supports:
 
@@ -152,7 +163,7 @@ Click `↻` on any book to re-roll type and colors, or repaint.
 
 ---
 
-## 12. Email Backup
+## 13. Email Backup
 
 `⌘E` emails a timestamped PDF snapshot of your draft to yourself, with a SHA-256 fingerprint of the text in the body.
 
@@ -160,7 +171,7 @@ Crypto bros rejoice — it creates a paper trail proving your words existed on a
 
 ---
 
-## 13. Safety
+## 14. Safety
 
 Everything is saved constantly, into plain files in `~/Documents/NEO Library`. Your chapters are just files on your disk.
 

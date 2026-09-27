@@ -18,6 +18,7 @@ NEO runs locally. WIPs are saved as plain files on your disk. No accounts, no su
   - [Darlings](#darlings)
   - [Placeholders](#placeholders)
   - [Outlining for Plotters](#outlining-for-plotters)
+  - [Writing AI](#writing-ai)
   - [Cover Art](#cover-art)
   - [Goals and Momentum](#goals-and-momentum)
   - [Exports](#exports)
@@ -81,6 +82,15 @@ Mid-flow and need a name, a fact, a date? `⌘⇧X` drops a mark and a sticky no
 
 Outline chapters and sections in the **Outline** tab; section notes appear in the manuscript as gray ghost paragraphs, ready to be overwritten. Pantsers can ignore all of it — or learn to draw a freakin' map for the first time. Try it. You might like it!
 
+### Writing AI
+
+NEO’s optional Writing Assistant revises selected passages. Set it up deliberately under **File → Writing Assistant…**; NEO never prompts during onboarding or sends text unless you invoke Rewrite.
+
+- **Local AI.** Set up a small Ollama model that runs privately on your computer, with no account or API key.
+- **API key.** Use OpenAI or another OpenAI-compatible service. Keys are stored encrypted on this computer, **never in your library folder**.
+
+Placeholders start with `⌘⇧X` / `Ctrl+Shift+X`: type a short note inline, then later supply final text and choose **Insert & resolve**. Select prose to reveal the quiet **Rewrite** action; every proposed revision is previewed before replacement.
+
 ### Cover Art
 
 Every book gets a cover!
@@ -88,7 +98,7 @@ Every book gets a cover!
 - New books are dressed in a seeded abstract — six art styles, six type templates, typefaces bundled with NEO, so no two stories on the shelf look alike.
 - Once a story passes 1,000 words, NEO can read it and paint an abstract cover from the text.
 
-> **Heads up:** This requires a bit more work but is totally worth it. Get an OpenAI API key from their website and paste it into *Goals & Settings*. Art is generated in the background for about a penny a picture. (These are not meant for publication — just writing inspiration!) The API key is stored encrypted in NEO's own settings, **never in your library folder**.
+> **Heads up:** This requires a bit more work but is totally worth it. Get an OpenAI API key from their website and paste it under *File → Cover Art…*. Art is generated in the background for about a penny a picture. (These are not meant for publication — just writing inspiration!) The API key is stored encrypted in NEO's own settings, **never in your library folder**.
 >
 > The title and author are always set in real type on top, so the lettering is never left to a gen-AI model. The `↻` on any book re-rolls its type and colors, or paints it again. You can always switch back and forth between the seeded modern look and the painted variety.
 

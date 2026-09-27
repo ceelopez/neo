@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld('neo', {
 
   readJSON: (bookId, name, fallback) => ipcRenderer.invoke('json:read', bookId, name, fallback),
   writeJSON: (bookId, name, data) => ipcRenderer.invoke('json:write', bookId, name, data),
+  deleteRetiredJSON: (bookId, name) => ipcRenderer.invoke('json:deleteRetired', bookId, name),
 
   exportSave: (payload) => ipcRenderer.invoke('export:save', payload),
   emailDraft: (payload) => ipcRenderer.invoke('email:draft', payload),
@@ -29,8 +30,16 @@ contextBridge.exposeInMainWorld('neo', {
   removeCover: (bookId) => ipcRenderer.invoke('cover:remove', bookId),
   readCover: (bookId, fname) => ipcRenderer.invoke('cover:read', bookId, fname),
   paintCover: (bookId, text, options) => ipcRenderer.invoke('cover:paint', bookId, text, options),
+  aiChat: (bookId, feature, payload) => ipcRenderer.invoke('ai:chat', bookId, feature, payload),
+  aiModels: (baseUrl, providerId) => ipcRenderer.invoke('ai:models', baseUrl, providerId),
   setSecret: (name, value) => ipcRenderer.invoke('secret:set', name, value),
   hasSecret: (name) => ipcRenderer.invoke('secret:has', name),
+  ollamaDetect: () => ipcRenderer.invoke('ollama:detect'),
+  ollamaSetup: () => ipcRenderer.invoke('ollama:setup'),
+  ollamaPull: (name) => ipcRenderer.invoke('ollama:pull', name),
+  ollamaCancel: () => ipcRenderer.invoke('ollama:cancel'),
+  openUrl: (url) => ipcRenderer.invoke('shell:openUrl', url),
+  pocket: false,
   importFiles: (paths) => ipcRenderer.invoke('import:files', paths),
   pathForFile: (file) => webUtils.getPathForFile(file),
   fullscreenEscape: () => ipcRenderer.invoke('fullscreen:escape'),
@@ -43,5 +52,10 @@ contextBridge.exposeInMainWorld('neo', {
   openRelease: () => ipcRenderer.invoke('update:openRelease'),
 
   poetryState: (on) => ipcRenderer.send('poetry:state', on),
-  onMenu: (cb) => ipcRenderer.on('menu', (_e, msg) => cb(msg))
+  onMenu: (cb) => ipcRenderer.on('menu', (_e, msg) => cb(msg)),
+  onOllamaEvent: (cb) => {
+    const h = (_e, msg) => cb(msg);
+    ipcRenderer.on('ollama:event', h);
+    return () => ipcRenderer.removeListener('ollama:event', h);
+  }
 });

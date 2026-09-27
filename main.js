@@ -183,6 +183,14 @@ ipcMain.handle('json:write', (_e, bookId, name, data) => {
   return true;
 });
 
+// Reserved for retired, app-owned caches. Never accepts arbitrary filenames.
+ipcMain.handle('json:deleteRetired', (_e, bookId, name) => {
+  if (name !== 'lore') return false;
+  const file = path.join(bookDir(bookId), name + '.json');
+  if (fs.existsSync(file)) fs.unlinkSync(file);
+  return true;
+});
+
 ipcMain.handle('book:delete', async (_e, bookId, title) => {
   const win = BrowserWindow.getFocusedWindow();
   const { response } = await dialog.showMessageBox(win, {
@@ -307,6 +315,112 @@ ipcMain.handle('secret:set', (_e, name, value) => {
 
 ipcMain.handle('secret:has', (_e, name) => !!readSecret(name));
 
+// ---------------------------------------------------------------------------
+// Text AI: one chat endpoint per OpenAI-compatible provider. Keys are the
+// same per-provider secrets as covers (secret name = provider id).
+// ---------------------------------------------------------------------------
+
+const aiJobs = new Map(); // bookId:feature -> promise (no double-sends)
+
+// Local engines (Ollama & friends) don't need a key — Ollama ignores the
+// auth header entirely, so a placeholder rides along.
+function aiKeyFor(providerId, baseUrl) {
+  const secret = readSecret(providerId);
+  if (secret) return secret;
+  try {
+    const host = new URL(String(baseUrl || '')).hostname;
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return 'local';
+  } catch { /* not a URL — needs the secret */ }
+  return null;
+}
+
+ipcMain.handle('ai:chat', (_e, bookId, feature, payload) => {
+  const key = String(bookId || 'global') + ':' + String(feature || 'chat');
+  if (aiJobs.has(key)) return aiJobs.get(key);
+  const job = (async () => {
+    try {
+      const providerId = (payload && payload.provider) || 'openai';
+      const apiKey = aiKeyFor(providerId, payload && payload.baseUrl);
+      if (!apiKey) return { error: 'No API key for this provider — add one under File → Writing Assistant…' };
+      const ai = require('./ai.js');
+      const out = await ai.chat({
+        baseUrl: (payload && payload.baseUrl) || 'https://api.openai.com/v1',
+        apiKey,
+        model: payload && payload.model,
+        messages: (payload && payload.messages) || [],
+        maxTokens: (payload && payload.maxTokens) || 800,
+        ollama: providerId === 'ollama'
+      });
+      return { text: out.result, model: out.model };
+    } catch (err) {
+      logError('ai-chat', err);
+      return { error: String((err && err.message) || err) };
+    }
+  })();
+  aiJobs.set(key, job);
+  job.finally(() => aiJobs.delete(key));
+  return job;
+});
+
+ipcMain.handle('ai:models', async (_e, baseUrl, providerId) => {
+  try {
+    const apiKey = aiKeyFor(providerId || 'openai', baseUrl);
+    if (!apiKey) return { models: [] };
+    const ai = require('./ai.js');
+    const models = await ai.listTextModels(baseUrl || 'https://api.openai.com/v1', apiKey);
+    return { models };
+  } catch (err) {
+    return { models: [], error: String((err && err.message) || err) };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Local AI (Ollama): the guided setup behind File → Writing Assistant.
+// Long work (install, pull) reports progress on the 'ollama:event' channel.
+// ---------------------------------------------------------------------------
+
+function sendOllamaEvent(payload) {
+  const w = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+  if (w && !w.isDestroyed()) w.webContents.send('ollama:event', payload);
+}
+
+ipcMain.handle('ollama:detect', async () => {
+  try {
+    const ollamaLib = require('./ollama.js');
+    const [hw, st, installedModels] = await Promise.all([ollamaLib.detectHardware(), ollamaLib.status(), ollamaLib.installedModels()]);
+    return { hw, running: st.running, version: st.version, installedModels, ...ollamaLib.suggestModels(hw) };
+  } catch (err) {
+    logError('ollama-detect', err);
+    return { hw: { platform: process.platform, ramGB: 0, gpu: null }, running: false, models: [], smaller: [], error: String((err && err.message) || err) };
+  }
+});
+
+ipcMain.handle('ollama:setup', () => {
+  const ollamaLib = require('./ollama.js');
+  return ollamaLib.ensureReady(sendOllamaEvent);
+});
+
+ipcMain.handle('ollama:pull', (_e, name) => {
+  const ollamaLib = require('./ollama.js');
+  return ollamaLib.pull(String(name || ''), sendOllamaEvent);
+});
+
+ipcMain.handle('ollama:cancel', () => {
+  const ollamaLib = require('./ollama.js');
+  return ollamaLib.cancel('pull');
+});
+
+ipcMain.handle('shell:openUrl', (_e, url) => {
+  try {
+    const u = new URL(String(url || ''));
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+    require('electron').shell.openExternal(u.href);
+    return true;
+  } catch {
+    return false;
+  }
+});
+
 // One painting at a time per book; a second request while one is running
 // simply gets the running one's answer.
 const paintJobs = new Map();
@@ -316,7 +430,7 @@ ipcMain.handle('cover:paint', (_e, bookId, text, options) => {
   const job = (async () => {
     const provider = (options && options.provider) || 'openai';
     const apiKey = readSecret(provider);
-    if (!apiKey) return { error: 'No API key for ' + provider + ' — add one under File → Cover Art…' };
+      if (!apiKey) return { error: 'No API key for ' + provider + ' — add one under File → Cover Art…' };
     const dir = bookDir(bookId);
     if (!fs.existsSync(dir)) return { error: 'Book folder is missing' };
     try {
@@ -327,7 +441,8 @@ ipcMain.handle('cover:paint', (_e, bookId, text, options) => {
         text: String(text || ''),
         textModel: options && options.textModel,
         imageModel: options && options.imageModel,
-        quality: options && options.quality
+        quality: options && options.quality,
+        baseUrl: options && options.baseUrl
       });
       // sweep older paintings; the writer's own cover-*.png files are untouched
       for (const f of fs.readdirSync(dir)) {
@@ -779,6 +894,7 @@ function buildMenu() {
         },
         { label: 'Email Settings…', click: () => sendToWindow({ type: 'emailSettings' }) },
         { label: 'Cover Art…', click: () => sendToWindow({ type: 'coverArt' }) },
+        { label: 'Writing Assistant…', click: () => sendToWindow({ type: 'writingAssistant' }) },
         {
           label: isMac ? 'Goals & Settings…' : 'Goals && Settings…',
           accelerator: 'CmdOrCtrl+,',

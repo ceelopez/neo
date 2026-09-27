@@ -151,13 +151,28 @@ const openai = openaiStyle({
 
 const PROVIDERS = { openai };
 
+// A provider id unknown at load time (a user-added OpenAI-compatible
+// endpoint) reuses the OpenAI dialect at its own base URL.
+function providerFor(id, baseUrl) {
+  if (PROVIDERS[id]) return PROVIDERS[id];
+  if (baseUrl && String(baseUrl).trim()) {
+    return openaiStyle({
+      base: String(baseUrl).trim().replace(/\/+$/, ''),
+      textModels: ['gpt-5-mini', 'gpt-4.1-mini', 'gpt-4o-mini'],
+      imageModels: ['gpt-image-1-mini', 'gpt-image-1'],
+      imageExtras: { output_format: 'jpeg' },
+      sizeParams: true
+    });
+  }
+  throw new Error('Unknown cover-art provider: ' + id);
+}
+
 // The whole job: text in, { buffer, ext, brief, textModel, imageModel } out.
-async function paintCover({ provider, apiKey, text, textModel, imageModel, quality }) {
-  const p = PROVIDERS[provider || 'openai'];
-  if (!p) throw new Error('Unknown cover-art provider: ' + provider);
+async function paintCover({ provider, apiKey, text, textModel, imageModel, quality, baseUrl }) {
+  const p = providerFor(provider || 'openai', baseUrl);
   const b = await p.writeBrief({ apiKey, text, model: textModel });
   const i = await p.paint({ apiKey, brief: b.result, model: imageModel, quality });
   return { buffer: i.result.buffer, ext: i.result.ext, brief: b.result, textModel: b.model, imageModel: i.model };
 }
 
-module.exports = { paintCover, excerpt, PROVIDERS };
+module.exports = { paintCover, excerpt, PROVIDERS, openaiStyle, providerFor };

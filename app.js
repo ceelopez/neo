@@ -135,6 +135,14 @@ function coverUrl(meta) {
 async function loadLibrary() {
   libraryDirPath = await window.neo.libraryPath();
   library = await window.neo.readLibrary();
+  NeoWritingAssistant.init({
+    library: () => library,
+    bookId: () => book ? book.id : 'global',
+    toast,
+    askInput,
+    escape: escHtml
+  });
+  await NeoWritingAssistant.migrate();
   if (!library.firstRunDone) {
     showFirstRun();
   }
@@ -873,6 +881,8 @@ async function openBook(bookId) {
   }
   stickies = await window.neo.readJSON(bookId, 'stickies', []);
   darlings = await window.neo.readJSON(bookId, 'darlings', []);
+  // Continuity checking was retired; this was only a generated cache.
+  window.neo.deleteRetiredJSON(bookId, 'lore');
 
   $('#bookshelf-view').hidden = true;
   $('#editor-view').hidden = false;
@@ -973,8 +983,8 @@ function renderChapters() {
     body.contentEditable = 'true';
     body.spellcheck = false; // NEO runs its own spellcheck pass
     body.innerHTML = chapterHTML[chId] || '<p><br></p>';
-    // older marks used a "?" that read as a broken image — normalize to the flag
-    body.querySelectorAll('.ph-mark').forEach((m) => { m.textContent = '⚑'; });
+    // Older marks used glyphs or copied note labels — normalize to one quiet token.
+    body.querySelectorAll('.ph-mark').forEach(paintMark);
     // heal the engine's style-junk spans left by past merges and splits
     stripJunkSpans(body);
     // heal prose that got merged into a scene-break's styled paragraph:
@@ -1834,7 +1844,7 @@ function cleanPasteHtml(html) {
         // placeholder marks travel with their text; reconcileMarks pairs
         // each one back up with a note after the paste lands
         return r.mark
-          ? `<span class="ph-mark" data-sid="${escHtml(r.mark)}" contenteditable="false">⚑</span>`
+          ? `<span class="ph-mark" data-sid="${escHtml(r.mark)}" contenteditable="false"></span>`
           : '';
       }
       let t = escHtml(r.text);
@@ -2000,7 +2010,11 @@ function focusChapter(chId) {
 /*  PLACEHOLDERS + STICKIES                                            */
 /* ================================================================== */
 
-function insertPlaceholder() {
+// A placeholder is deliberately a quiet token, never prose copied from its note.
+function markLabel() { return ''; }
+function paintMark(m) { if (m) { m.textContent = markLabel(); m.title = 'Placeholder — click to complete'; } }
+function repaintMarks(sid) { document.querySelectorAll(`.ph-mark[data-sid="${sid}"]`).forEach(paintMark); }
+function legacyInsertPlaceholder() {
   const sel = window.getSelection();
   if (!sel.rangeCount) return;
   // derive the chapter from where the caret actually is:
@@ -2017,7 +2031,7 @@ function insertPlaceholder() {
   span.className = 'ph-mark';
   span.dataset.sid = sid;
   span.contentEditable = 'false';
-  span.textContent = '⚑';
+  span.textContent = '[ … ]';
   const range = sel.getRangeAt(0);
   range.collapse(false);
   range.insertNode(span);
@@ -2039,7 +2053,7 @@ function insertPlaceholder() {
   scheduleNavRefresh();
 }
 
-function renderStickies() {
+function legacyRenderStickies() {
   const wrap = $('#sticky-list');
   wrap.innerHTML = '';
   const open = stickies.filter((s) => !s.resolved);
@@ -2055,11 +2069,13 @@ function renderStickies() {
     el.innerHTML = `
       <div class="s-ch">${chIdx >= 0 ? 'Chapter ' + (chIdx + 1) : 'Unplaced'}</div>
       <textarea placeholder="What needs doing here?" spellcheck="false"></textarea>
-      <div class="s-actions"><button class="s-go">Go to</button> <button class="s-done">Resolve</button></div>`;
+      <div class="s-suggest"></div>
+      <div class="s-actions"><button class="s-idea" title="Brainstorm ideas for this placeholder (sends nearby text to your AI provider)">✦</button> <button class="s-go">Go to</button> <button class="s-done">Resolve</button></div>`;
     const ta = el.querySelector('textarea');
     ta.value = s.text;
     ta.addEventListener('input', () => {
       s.text = ta.value;
+      repaintMarks(s.id); // the bracket pill mirrors the note live
       clearTimeout(saveTimers.stickies);
       saveTimers.stickies = setTimeout(() => window.neo.writeJSON(book.id, 'stickies', stickies), 600);
     });
@@ -2069,8 +2085,209 @@ function renderStickies() {
       if (mark) mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
     };
     el.querySelector('.s-done').onclick = () => resolveSticky(s.id);
+    const ideaBtn = el.querySelector('.s-idea');
+    ideaBtn.appendChild(aiChip('placeholders'));
+    ideaBtn.onclick = (e) => { e.stopPropagation(); brainstormSticky(s.id); };
+    // cached suggestions from a previous brainstorm
+    if (s.suggestions && s.suggestions.length) renderStickySuggestions(el, s);
     wrap.appendChild(el);
   }
+}
+
+// Placeholder resolver: sends the sticky + ~1200 chars around its mark,
+// returns clickable chips that fill the textarea. Never touches the manuscript.
+async function legacyBrainstormSticky(sid) {
+  const s = stickies.find((x) => x.id === sid);
+  if (!s) return;
+  const mark = document.querySelector(`.ph-mark[data-sid="${sid}"]`);
+  let context = '';
+  if (mark) {
+    const body = mark.closest('.chapter-body');
+    const full = body ? body.innerText : '';
+    const idx = body ? Array.from(body.childNodes).indexOf(mark) : -1;
+    context = full.slice(Math.max(0, full.length > 4000 ? 0 : 0), 4000);
+    // cheaper: surrounding slice around the mark's paragraph
+    const para = mark.parentElement ? mark.parentElement.innerText : '';
+    context = (para || full).slice(0, 1500);
+  } else {
+    context = chapterText(s.chapterId).slice(0, 1500);
+  }
+  const chIdx = book.chapterOrder.indexOf(s.chapterId);
+  const btn = document.querySelector(`.sticky[data-sid="${sid}"] .s-idea`);
+  if (btn) btn.classList.add('busy');
+  const res = await aiAsk('placeholders', [
+    { role: 'system', content: 'You help a novelist stuck on a placeholder. Reply with 6-10 SHORT suggestions (names, facts, or one-line fills), one per line starting with "- ". No explanations, no prose paragraphs.' },
+    { role: 'user', content: `PLACEHOLDER NOTE: ${s.text || '(empty)'}\nCHAPTER: ${chIdx >= 0 ? chIdx + 1 : '?'} of "${book.title}"\nNEARBY TEXT:\n${context.slice(0, 1500)}` }
+  ], 500);
+  if (btn) btn.classList.remove('busy');
+  if (!res) return;
+  const lines = res.text.split('\n').map((l) => l.replace(/^[-*•\d.)\s]+/, '').trim()).filter((l) => l && l.length < 140).slice(0, 10);
+  s.suggestions = lines;
+  s.suggestModel = res.model;
+  await window.neo.writeJSON(book.id, 'stickies', stickies);
+  const el = document.querySelector(`.sticky[data-sid="${sid}"]`);
+  if (el) renderStickySuggestions(el, s);
+  toast(lines.length ? 'Ideas ready — click one to use it' : 'No ideas came back — try again');
+}
+function legacyRenderStickySuggestions(el, s) {
+  const box = el.querySelector('.s-suggest');
+  box.innerHTML = '';
+  for (const sug of (s.suggestions || [])) {
+    const b = document.createElement('button');
+    b.className = 's-sug';
+    b.textContent = sug;
+    b.title = 'Click to put this in the note';
+    b.onclick = () => {
+      s.text = sug;
+      el.querySelector('textarea').value = sug;
+      repaintMarks(s.id);
+      window.neo.writeJSON(book.id, 'stickies', stickies);
+    };
+    box.appendChild(b);
+  }
+}
+
+/* ================================================================== */
+/*  SELECTION REWRITE (invoke-only, original auto-saved to Darlings)   */
+/* ================================================================== */
+
+const REWRITE_ACTIONS = [
+  { id: 'tighten', label: 'Tighten', prompt: 'Tighten this passage: cut filler and repetition, keeping the author’s voice and meaning. Return only the revised text.' },
+  { id: 'lyrical', label: 'Lyrical', prompt: 'Make this passage more lyrical and sensory while keeping the same events and voice. Return only the revised text.' },
+  { id: 'simplify', label: 'Simplify', prompt: 'Simplify this passage to plain, clear prose at the same meaning. Return only the revised text.' }
+];
+let rewriteBar = null;
+function hideRewriteBar() { if (rewriteBar) { rewriteBar.remove(); rewriteBar = null; } }
+document.addEventListener('mouseup', (e) => {
+  if (!book || currentTab !== 'manuscript') return;
+  if (rewriteBar && rewriteBar.contains(e.target)) return;
+  setTimeout(() => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) { hideRewriteBar(); return; }
+    const range = sel.getRangeAt(0);
+    const body = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+      ? range.commonAncestorContainer.parentElement.closest('.chapter-body')
+      : range.commonAncestorContainer.closest?.('.chapter-body');
+    if (!body || sel.toString().trim().length < 20) { hideRewriteBar(); return; }
+    showRewriteBar(range);
+  }, 30);
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideRewriteBar(); });
+function showRewriteBar(range) {
+  hideRewriteBar();
+  const rect = range.getBoundingClientRect();
+  rewriteBar = document.createElement('div');
+  rewriteBar.className = 'rw-bar';
+  rewriteBar.innerHTML = REWRITE_ACTIONS.map((a) =>
+    `<button data-act="${a.id}" title="${a.prompt}">${a.label}</button>`).join('') +
+    `<button data-act="custom" title="Describe your own rewrite">…</button>`;
+  document.body.appendChild(rewriteBar);
+  rewriteBar.style.left = Math.min(window.innerWidth - 260, Math.max(8, rect.left + window.scrollX)) + 'px';
+  rewriteBar.style.top = (rect.bottom + window.scrollY + 6) + 'px';
+  rewriteBar.querySelectorAll('button').forEach((b) => {
+    b.onclick = () => {
+      const sel = window.getSelection();
+      const text = sel.toString();
+      const chEl = range.commonAncestorContainer.nodeType === Node.TEXT_NODE
+        ? range.commonAncestorContainer.parentElement.closest('.chapter')
+        : range.commonAncestorContainer.closest?.('.chapter');
+      hideRewriteBar();
+      rewriteSelection(text, b.dataset.act, chEl ? chEl.dataset.id : currentChapterId, range.cloneRange());
+    };
+  });
+}
+async function rewriteSelection(text, actionId, chId, range) {
+  let action = REWRITE_ACTIONS.find((a) => a.id === actionId);
+  if (actionId === 'custom') {
+    const custom = await askInput('Rewrite — how?', 'e.g. angrier, shorter sentences…', '');
+    if (!custom) return;
+    action = { id: 'custom', label: 'Custom', prompt: custom + ' Return only the revised text.' };
+  }
+  if (!action) return;
+  const styleCtx = chapterText(chId).slice(0, 600);
+  const pending = showRewritePending(range);
+  let res = null;
+  try {
+    res = await NeoWritingAssistant.ask([
+      { role: 'system', content: 'You are a line editor. ' + action.prompt },
+      { role: 'user', content: `VOICE SAMPLE (do not repeat):\n${styleCtx}\n\nPASSAGE TO REVISE:\n${text.slice(0, 3000)}` }
+    ], 800);
+  } finally {
+    pending.remove();
+  }
+  if (!res) return;
+  showFocusedRewritePreview(text, res.text, chId, range);
+}
+
+function showRewritePending(range) {
+  const card = document.createElement('div');
+  card.className = 'rw-pending';
+  card.innerHTML = '<span class="rw-spinner"></span><span>Thinking &amp; rewriting… <b>0:00</b></span>';
+  document.body.appendChild(card);
+  const rect = range.getBoundingClientRect();
+  card.style.left = Math.min(window.innerWidth - 250, Math.max(8, rect.left + window.scrollX)) + 'px';
+  card.style.top = (rect.bottom + window.scrollY + 8) + 'px';
+  const label = card.querySelector('span:last-child');
+  const started = Date.now();
+  const timer = setInterval(() => {
+    if (!card.isConnected) { clearInterval(timer); return; }
+    const seconds = Math.floor((Date.now() - started) / 1000);
+    const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+    label.innerHTML = `${seconds >= 15 ? 'Still thinking…' : 'Thinking &amp; rewriting…'} <b>${elapsed}</b>`;
+  }, 1000);
+  const remove = card.remove.bind(card);
+  card.remove = () => { clearInterval(timer); remove(); };
+  return card;
+}
+function showRewriteDiff(original, revised, model, chId, range) {
+  const bd = document.createElement('div');
+  bd.className = 'modal-backdrop';
+  bd.innerHTML = `
+    <div class="modal" style="width:600px">
+      <h2 style="font-size:16px">Rewrite — original goes to Darlings on accept</h2>
+      <div class="rw-cols">
+        <div><h4>Original (${countWords(original)}w)</h4><p class="rw-text"></p></div>
+        <div><h4>Revised (${countWords(revised)}w)</h4><p class="rw-text"></p></div>
+      </div>
+      <div class="rw-foot"><span class="soft">via ${escHtml(model || 'AI')}</span> <span id="rw-chip"></span></div>
+      <div style="text-align:right;margin-top:14px">
+        <button class="m-discard btn-quiet" style="margin-right:10px">Discard</button>
+        <button class="m-ok btn-gold">Accept (save original to Darlings)</button>
+      </div>
+    </div>`;
+  document.body.appendChild(bd);
+  bd.querySelectorAll('.rw-text')[0].textContent = original;
+  bd.querySelectorAll('.rw-text')[1].textContent = revised;
+  bd.querySelector('#rw-chip').appendChild(aiChip('rewrite'));
+  const done = () => bd.remove();
+  bd.querySelector('.m-discard').onclick = done;
+  bd.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); done(); } });
+  bd.querySelector('.m-ok').onclick = async () => {
+    snapshotStructure('rewrite accept');
+    // 1. original → Darlings (same shape as a cut)
+    const chIdx = book.chapterOrder.indexOf(chId);
+    darlings.unshift({
+      id: 'd-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 5),
+      html: '<p>' + escHtml(original).replace(/\n+/g, '</p><p>') + '</p>',
+      text: original, chapterId: chId,
+      chapterLabel: chIdx >= 0 ? 'Chapter ' + (chIdx + 1) : 'Manuscript',
+      date: new Date().toISOString()
+    });
+    await window.neo.writeJSON(book.id, 'darlings', darlings);
+    // 2. replace selection in place
+    try {
+      range.deleteContents();
+      range.insertNode(document.createRange().createContextualFragment(escHtml(revised).replace(/\n+/g, '<br>')));
+    } catch {
+      // selection moved on — append at end of chapter instead of losing words
+      const body = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
+      if (body) { body.insertAdjacentHTML('beforeend', '<p>' + escHtml(revised) + '</p>'); }
+    }
+    const body = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
+    if (body) syncChapter(body, chId);
+    done();
+    toast('Rewritten — original is in Darlings');
+  };
 }
 
 // Pair every mark in the manuscript with a note: pasted duplicates get their
@@ -2089,18 +2306,19 @@ function reconcileMarks() {
     if (seen.has(sid)) {
       const nid = 's-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 5);
       m.dataset.sid = nid;
-      stickies.push({ id: nid, chapterId: chId, text: existing ? existing.text : '', resolved: false });
+      stickies.push({ id: nid, chapterId: chId, note: existing ? placeholderNote(existing) : '', finalText: '', suggestions: [], resolved: false });
       seen.add(nid);
       changed = true;
       continue;
     }
     if (!existing) {
-      stickies.push({ id: sid, chapterId: chId, text: '', resolved: false });
+      stickies.push({ id: sid, chapterId: chId, note: '', finalText: '', suggestions: [], resolved: false });
       changed = true;
     } else if (existing.chapterId !== chId) {
       existing.chapterId = chId;
       changed = true;
     }
+    paintMark(m); // pasted/healed marks arrive with placeholder text
     seen.add(sid);
   }
   if (changed) {
@@ -2110,7 +2328,7 @@ function reconcileMarks() {
   }
 }
 
-function resolveSticky(sid) {
+function legacyResolveSticky(sid) {
   const mark = document.querySelector(`.ph-mark[data-sid="${sid}"]`);
   if (mark) {
     const chId = mark.closest('.chapter').dataset.id;
@@ -2140,6 +2358,119 @@ function focusSticky(sid) {
   $('#side-pane').classList.add('open');
   const el = document.querySelector(`.sticky[data-sid="${sid}"] textarea`);
   if (el) el.focus();
+}
+
+function showFocusedRewritePreview(original, revised, chId, range) {
+  const card = document.createElement('div');
+  card.className = 'rw-preview';
+  card.innerHTML = `<div class="rw-preview-title">Rewrite preview</div>
+    <p class="rw-preview-original"></p><p class="rw-preview-revised"></p>
+    <div><button class="rw-cancel btn-quiet">Cancel</button><button class="rw-replace btn-gold">Replace</button></div>`;
+  card.querySelector('.rw-preview-original').textContent = original;
+  card.querySelector('.rw-preview-revised').textContent = revised;
+  document.body.appendChild(card);
+  const rect = range.getBoundingClientRect();
+  card.style.left = Math.min(window.innerWidth - 380, Math.max(8, rect.left + window.scrollX)) + 'px';
+  card.style.top = (rect.bottom + window.scrollY + 8) + 'px';
+  const close = () => card.remove();
+  card.querySelector('.rw-cancel').onclick = close;
+  card.querySelector('.rw-replace').onclick = () => {
+    const body = document.querySelector(`.chapter[data-id="${chId}"] .chapter-body`);
+    if (!body || !range.commonAncestorContainer.isConnected || !body.contains(range.commonAncestorContainer.nodeType === Node.TEXT_NODE ? range.commonAncestorContainer.parentElement : range.commonAncestorContainer)) {
+      close(); toast('The selection changed, so NEO left your manuscript untouched'); return;
+    }
+    const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+    if (!document.execCommand('insertText', false, revised)) { close(); toast('Could not safely replace that selection'); return; }
+    syncChapter(body, chId); close();
+  };
+}
+
+// Focused placeholder controller. The manuscript only owns the token; the
+// linked record owns intent, candidate ideas, and the final replacement.
+function insertPlaceholder() {
+  const sel = window.getSelection();
+  if (!sel.rangeCount) return;
+  let node = sel.anchorNode;
+  if (node && node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+  const body = node && node.closest ? node.closest('.chapter-body') : null;
+  if (!body) { toast(`Click into a chapter first, then ${KPH} creates a placeholder`); return; }
+  const chId = body.closest('.chapter').dataset.id;
+  const sid = 's-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 5);
+  const entry = document.createElement('span');
+  entry.className = 'ph-entry'; entry.contentEditable = 'false';
+  entry.innerHTML = '<input aria-label="Placeholder note" placeholder="What belongs here?" spellcheck="false">';
+  const range = sel.getRangeAt(0); range.collapse(false); range.insertNode(entry);
+  const after = document.createTextNode(' '); entry.after(after);
+  const input = entry.querySelector('input');
+  let finished = false;
+  const finish = (keep) => {
+    if (finished) return; finished = true;
+    const note = input.value.trim();
+    if (!keep || !note) { entry.remove(); after.remove(); return; }
+    const mark = document.createElement('span');
+    mark.className = 'ph-mark'; mark.dataset.sid = sid; mark.contentEditable = 'false'; paintMark(mark);
+    entry.replaceWith(mark);
+    stickies.push({ id: sid, chapterId: chId, note, finalText: '', suggestions: [], resolved: false });
+    chapterHTML[chId] = captureBody(body); scheduleChapterSave(chId);
+    renderStickies(); scheduleNavRefresh();
+    const caret = document.createRange(); caret.setStartAfter(after); caret.collapse(true);
+    sel.removeAllRanges(); sel.addRange(caret); body.focus();
+  };
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    if (e.key === 'Escape') { e.preventDefault(); finish(false); body.focus(); }
+  };
+  input.onblur = () => finish(true);
+  input.focus();
+}
+
+function placeholderNote(s) { return s.note != null ? s.note : (s.text || ''); }
+function saveStickies() { return window.neo.writeJSON(book.id, 'stickies', stickies); }
+function renderStickies() {
+  const wrap = $('#sticky-list'); wrap.innerHTML = '';
+  const open = stickies.filter((s) => !s.resolved);
+  if (!open.length) {
+    wrap.innerHTML = `<div class="stickies-empty">No placeholders yet.<br><br>Hit ${KPH} while writing to leave yourself a quiet marker.</div>`;
+    return;
+  }
+  for (const s of open) {
+    const ch = book.chapterOrder.indexOf(s.chapterId);
+    const el = document.createElement('div'); el.className = 'sticky unresolved'; el.dataset.sid = s.id;
+    el.innerHTML = `<div class="s-ch">${ch >= 0 ? 'Chapter ' + (ch + 1) : 'Unplaced'}</div>
+      <label class="s-label">Note<textarea class="s-note" placeholder="What belongs here?" spellcheck="false"></textarea></label>
+      <label class="s-label">Final text<input class="s-final" placeholder="Text to insert" spellcheck="false" /></label>
+      <div class="s-actions"><button class="s-go">Go to</button><button class="s-insert btn-gold">Insert &amp; resolve</button><button class="s-discard btn-quiet" title="Discard this placeholder">Discard</button></div>`;
+    const note = el.querySelector('.s-note'); const final = el.querySelector('.s-final');
+    note.value = placeholderNote(s); final.value = s.finalText || '';
+    const persist = () => { s.note = note.value; s.finalText = final.value; delete s.text; saveStickies(); };
+    note.oninput = persist; final.oninput = persist;
+    el.querySelector('.s-go').onclick = () => { switchTab('manuscript'); const mark = document.querySelector(`.ph-mark[data-sid="${s.id}"]`); if (mark) mark.scrollIntoView({ behavior: 'smooth', block: 'center' }); };
+    el.querySelector('.s-insert').onclick = () => insertAndResolvePlaceholder(s.id);
+    el.querySelector('.s-discard').onclick = () => resolveSticky(s.id);
+    wrap.appendChild(el);
+  }
+}
+
+function insertAndResolvePlaceholder(sid) {
+  const s = stickies.find((x) => x.id === sid); const mark = document.querySelector(`.ph-mark[data-sid="${sid}"]`);
+  const finalText = s && String(s.finalText || '').trim();
+  if (!finalText) { toast('Add final text before inserting it'); return; }
+  if (!mark) { toast('That placeholder is no longer in the manuscript'); return; }
+  const body = mark.closest('.chapter-body'); const chId = mark.closest('.chapter').dataset.id;
+  const range = document.createRange(); range.selectNode(mark);
+  const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+  const replaced = document.execCommand('insertText', false, finalText);
+  if (!replaced || mark.isConnected) { toast('Could not safely replace that placeholder — your text was not changed'); return; }
+  stickies = stickies.filter((x) => x.id !== sid); saveStickies();
+  chapterHTML[chId] = captureBody(body); scheduleChapterSave(chId); renderStickies(); scheduleNavRefresh();
+}
+
+function resolveSticky(sid) {
+  const s = stickies.find((x) => x.id === sid);
+  if (s && (placeholderNote(s).trim() || String(s.finalText || '').trim()) && !window.confirm('Discard this placeholder and its note?')) return;
+  const mark = document.querySelector(`.ph-mark[data-sid="${sid}"]`);
+  if (mark) { const body = mark.closest('.chapter-body'); const chId = mark.closest('.chapter').dataset.id; mark.remove(); body.normalize(); chapterHTML[chId] = captureBody(body); scheduleChapterSave(chId); }
+  stickies = stickies.filter((x) => x.id !== sid); saveStickies(); renderStickies(); scheduleNavRefresh();
 }
 
 /* ================================================================== */
@@ -2601,6 +2932,84 @@ function switchTab(name) {
       returnTo();
     });
   }
+}
+
+/* Blurb / synopsis / query — output appends to Notes, never the manuscript. */
+async function generateBookText(kind) {
+  const full = bookPlainText();
+  if (countWords(full) < 50) { toast('Write a little more first — NEO needs something to read'); return; }
+  const words = full.replace(/\s+/g, ' ').trim().split(' ');
+  const excerpt = words.length <= 6000 ? words.join(' ')
+    : words.slice(0, 4500).join(' ') + '\n\n[…]\n\n' + words.slice(-1500).join(' ');
+  const prompts = {
+    blurb: 'Write a 120-180 word back-cover blurb for this novel. Present tense, no spoilers past the midpoint, no invented names. Return only the blurb.',
+    synopsis: 'Write a one-page synopsis of this novel (400-600 words): setup, midpoint turn, climax, resolution, naming the main characters. Return only the synopsis.',
+    query: 'Write a query-letter draft for this novel: hook paragraph, 150-word premise, metadata line (title, genre, word count), short bio placeholder. Return only the letter.'
+  };
+  toast(`Reading your manuscript for a ${kind}…`);
+  const res = await aiAsk('synopsis', [
+    { role: 'system', content: 'You are a publishing copywriter. ' + (prompts[kind] || prompts.blurb) },
+    { role: 'user', content: `TITLE: ${book.title}\nAUTHOR: ${book.author || ''}\nWORDS: ${bookWordCount()}\n\nMANUSCRIPT EXCERPT:\n${excerpt}` }
+  ], 1200);
+  if (!res) return;
+  const stamp = new Date().toLocaleDateString();
+  const html = `<h3>✦ ${kind} — AI draft (${stamp}, ${escHtml(res.model || '')})</h3><p>${escHtml(res.text).replace(/\n+/g, '</p><p>')}</p><p>---</p>`;
+  const cur = await window.neo.readAux(book.id, 'notes');
+  await window.neo.writeAux(book.id, 'notes', (cur || '') + html);
+  if (currentTab === 'notes') {
+    $('#aux-editor').innerHTML += html;
+    toast(`${kind} added to Notes — edit freely`);
+  } else {
+    toast(`${kind} added to Notes`);
+  }
+}
+
+/* Continuity / lore bible — manual trigger, cached by word count. */
+function loreHash() { return bookWordCount() + ':' + book.chapterOrder.length; }
+async function runContinuityCheck() {
+  const full = bookPlainText();
+  if (countWords(full) < 200) { toast('Not enough manuscript yet for a continuity check'); return; }
+  toast('Reading your manuscript for continuity…');
+  const words = full.replace(/\s+/g, ' ').trim().split(' ');
+  const ex = words.length <= 8000 ? words.join(' ')
+    : words.slice(0, 6000).join(' ') + '\n\n[…]\n\n' + words.slice(-2000).join(' ');
+  const res = await aiAsk('continuity', [
+    { role: 'system', content: 'You are a continuity editor. Extract main characters, places, and timeline, then flag contradictions (eye color, names, dates, who-knows-what). Reply as JSON: {"characters":[{"name":str,"facts":[str]}],"places":[str],"timeline":[str],"flags":[{"msg":str,"chapter":number}]}. Keep it short.' },
+    { role: 'user', content: `TITLE: ${book.title}\nCHAPTERS: ${book.chapterOrder.length}\n\nTEXT:\n${ex}` }
+  ], 1200);
+  if (!res) return;
+  let lore = null;
+  try {
+    const m = res.text.match(/\{[\s\S]*\}/);
+    lore = JSON.parse(m ? m[0] : res.text);
+  } catch { lore = { flags: [{ msg: 'AI reply was not JSON — see Notes for the raw text.' }], raw: res.text }; }
+  lore.updatedAt = new Date().toISOString();
+  lore.hash = loreHash();
+  lore.model = res.model;
+  await window.neo.writeJSON(book.id, 'lore', lore);
+  renderLoreBox();
+  toast('Continuity check done');
+}
+async function renderLoreBox() {
+  let box = $('#lore-box');
+  if (!box) return;
+  const lore = await window.neo.readJSON(book.id, 'lore', null);
+  if (!lore) { box.innerHTML = '<p class="soft" style="font-size:12px">No lore bible yet — hit ✦ Check continuity. Stored as lore.json in your book folder.</p>'; return; }
+  const stale = lore.hash !== loreHash() ? ' <em>(manuscript changed since — re-run to refresh)</em>' : '';
+  const chars = (lore.characters || []).slice(0, 12).map((c) =>
+    `<li><strong>${escHtml(c.name)}</strong> — ${escHtml((c.facts || []).slice(0, 4).join('; '))}</li>`).join('');
+  const flags = (lore.flags || []).map((f) =>
+    `<li class="lore-flag">⚠ ${escHtml(f.msg)}${f.chapter ? ` <button data-ch="${f.chapter}">Ch ${f.chapter}</button>` : ''}</li>`).join('');
+  box.innerHTML = `<div class="lore-card"><div class="soft" style="font-size:11px">Lore bible · ${escHtml(lore.updatedAt.slice(0, 10))} · ${escHtml(lore.model || '')}${stale}</div>
+    ${chars ? `<ul class="lore-chars">${chars}</ul>` : ''}${flags ? `<ul>${flags}</ul>` : '<p class="soft">No contradictions found.</p>'}</div>`;
+  box.querySelectorAll('[data-ch]').forEach((b) => {
+    b.onclick = () => {
+      switchTab('manuscript');
+      const idx = (+b.dataset.ch) - 1;
+      const chId = book.chapterOrder[idx];
+      if (chId) focusChapter(chId);
+    };
+  });
 }
 
 /* ================================================================== */
@@ -3910,6 +4319,716 @@ function openCoverArt() {
   key.focus();
 }
 
+/* ================================================================== */
+/*  AI PROVIDERS + PER-FEATURE MODELS (File → AI Setup…)               */
+/*  One key per provider id, stored encrypted via secret:set/has.      */
+/*  library.ai = { providers:{id:{name,baseUrl}},                      */
+/*    features:{placeholders,continuity,synopsis,rewrite:{provider,model}} } */
+/*  Covers keep living in library.coverArt; the AI modal edits both.   */
+/* ================================================================== */
+
+const AI_FEATURES = [
+  { id: 'placeholders', label: 'Placeholders', hint: 'sticky ✦ brainstorm' },
+  { id: 'continuity', label: 'Continuity', hint: 'lore check' },
+  { id: 'synopsis', label: 'Blurb & synopsis', hint: 'notes generator' },
+  { id: 'rewrite', label: 'Rewrite', hint: 'selection tuner' }
+];
+const DEFAULT_BASE = 'https://api.openai.com/v1';
+// Local engines (Ollama, LM Studio) run on localhost and need no key.
+const aiIsLocalUrl = (u) => {
+  try {
+    const h = new URL(String(u || '')).hostname;
+    return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+  } catch { return false; }
+};
+
+function aiConf() {
+  library.ai = library.ai || {};
+  library.ai.providers = library.ai.providers || {
+    openai: { name: 'OpenAI', baseUrl: DEFAULT_BASE }
+  };
+  library.ai.features = library.ai.features || {};
+  return library.ai;
+}
+// Migrate legacy cover-only config so old keys keep working.
+function aiProviders() {
+  const ai = aiConf();
+  const legacy = (library.coverArt && library.coverArt.provider) || 'openai';
+  if (!ai.providers[legacy]) ai.providers[legacy] = { name: legacy === 'openai' ? 'OpenAI' : legacy, baseUrl: DEFAULT_BASE };
+  if (!ai.providers.openai) ai.providers.openai = { name: 'OpenAI', baseUrl: DEFAULT_BASE };
+  return ai.providers;
+}
+function aiFeatureRoute(feature) {
+  const ai = aiConf();
+  const f = ai.features[feature] || {};
+  const providers = aiProviders();
+  let provider = f.provider && providers[f.provider] ? f.provider : null;
+  if (!provider) {
+    const legacy = (library.coverArt && library.coverArt.provider) || 'openai';
+    provider = providers[legacy] ? legacy : 'openai';
+  }
+  const legacyModels = (library.coverArt && library.coverArt.models && library.coverArt.models[provider]) || {};
+  return {
+    provider,
+    model: f.model || legacyModels.text || '',
+    baseUrl: (providers[provider] && providers[provider].baseUrl) || DEFAULT_BASE
+  };
+}
+async function aiSaveFeatureRoute(feature, provider, model) {
+  const ai = aiConf();
+  ai.features[feature] = { provider, model: (model || '').trim() || undefined };
+  await window.neo.writeLibrary(library);
+}
+const aiShort = (route) => {
+  const prov = aiProviders()[route.provider];
+  const pname = prov ? prov.name : route.provider;
+  const short = pname.length > 6 ? pname.slice(0, 6) : pname;
+  return `${short}/${(route.model || 'default').slice(0, 18) || 'default'}`;
+};
+// Compact faded chip used in sticky cards, diff modals, lore/synopsis headers.
+// One line, ~12px, expands to a popover for that feature only.
+function aiChip(feature) {
+  const route = aiFeatureRoute(feature);
+  const span = document.createElement('button');
+  span.className = 'ai-chip';
+  span.title = `AI model for this — click to switch (currently ${route.provider} / ${route.model || 'default'})`;
+  span.textContent = `✦ ${aiShort(route)} ▾`;
+  span.onclick = (e) => { e.stopPropagation(); aiChipPopover(span, feature); };
+  return span;
+}
+function aiChipPopover(anchor, feature) {
+  document.querySelectorAll('.ai-pop').forEach((n) => n.remove());
+  const route = aiFeatureRoute(feature);
+  const providers = aiProviders();
+  const pop = document.createElement('div');
+  pop.className = 'ai-pop';
+  pop.innerHTML = `
+    <label>Provider <select class="ai-p-prov">${Object.entries(providers).map(([id, p]) =>
+      `<option value="${id}"${id === route.provider ? ' selected' : ''}>${escHtml(p.name)}</option>`).join('')}</select></label>
+    <label>Model <input class="ai-p-model" list="ai-pop-dl" spellcheck="false" placeholder="default" value="${escHtml(route.model || '')}"/></label>
+    <datalist id="ai-pop-dl"></datalist>
+    <div class="ai-p-row"><button class="ai-p-save btn-gold">Use</button>
+    <button class="ai-p-manage btn-quiet">Manage…</button></div>`;
+  document.body.appendChild(pop);
+  // offer the provider's real model names when we can get them
+  (async () => {
+    const provLocal = !!(providers[route.provider] && providers[route.provider].local);
+    if (!provLocal && !(await window.neo.hasSecret(route.provider))) return;
+    const res = await window.neo.aiModels(route.baseUrl, route.provider);
+    if (res && !res.error && res.models && res.models.length) {
+      const dl = pop.querySelector('#ai-pop-dl');
+      if (dl) dl.innerHTML = res.models.map((n) => `<option value="${escHtml(n)}">`).join('');
+    }
+  })();
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = Math.min(window.innerWidth - 250, Math.max(8, r.left - 40)) + 'px';
+  pop.style.top = (r.bottom + 6 + window.scrollY) + 'px';
+  const close = () => pop.remove();
+  setTimeout(() => document.addEventListener('click', close, { once: true }), 0);
+  pop.querySelector('.ai-p-save').onclick = async (e) => {
+    e.stopPropagation();
+    await aiSaveFeatureRoute(feature, pop.querySelector('.ai-p-prov').value, pop.querySelector('.ai-p-model').value);
+    close();
+    toast(`AI model updated for ${feature}`);
+    if (typeof renderStickies === 'function' && book) renderStickies();
+  };
+  pop.querySelector('.ai-p-manage').onclick = (e) => { e.stopPropagation(); close(); openAiSetup(); };
+}
+// Unified chat call: resolves provider+model, surfaces {text,model} or toast+null.
+async function aiAsk(feature, messages, maxTokens = 800) {
+  const route = aiFeatureRoute(feature);
+  const prov = aiProviders()[route.provider] || {};
+  const local = prov.local || aiIsLocalUrl(route.baseUrl);
+  if (!local && !(await window.neo.hasSecret(route.provider))) {
+    if (window.neo.pocket) toast('Add an API key under File → AI Setup… first', 6000);
+    else {
+      const pick = await aiOfferModal();
+      if (pick) openAiSetup(pick);
+    }
+    return null;
+  }
+  const res = await window.neo.aiChat(book ? book.id : 'global', feature, {
+    provider: route.provider, baseUrl: route.baseUrl,
+    model: route.model || undefined, messages, maxTokens
+  });
+  if (!res || res.error) { toast('NEO’s AI hiccuped: ' + ((res && res.error) || 'unknown'), 7000); return null; }
+  return res;
+}
+
+function openAiSetup(path) {
+  // The guided door: hand the whole local install to the wizard.
+  if (path === 'local' && !window.neo.pocket) { runLocalAiWizard(); return; }
+  // Work on copies — nothing persists until Save. Keys are the exception:
+  // they live in the encrypted secret store and save immediately.
+  const ai = aiConf();
+  const draft = JSON.parse(JSON.stringify(aiProviders()));
+  const draftFeat = {};
+  for (const f of AI_FEATURES) {
+    const r = aiFeatureRoute(f.id);
+    draftFeat[f.id] = { provider: r.provider, model: r.model || '' };
+  }
+  const modelCache = {}; // providerId -> [model names] pulled from /models
+  const bd = document.createElement('div');
+  bd.className = 'modal-backdrop';
+  const provOptions = (sel) => Object.entries(draft).map(([id, p]) =>
+    `<option value="${id}"${id === sel ? ' selected' : ''}>${escHtml(p.name)}</option>`).join('');
+  const featRows = AI_FEATURES.map((f) => `
+    <div class="stats-row ai-feat" data-feat="${f.id}">
+      <span class="ai-feat-label">${f.label}<em>${f.hint}</em></span>
+      <select class="ai-f-prov">${provOptions(draftFeat[f.id].provider)}</select>
+      <input class="ai-f-model" list="ai-dl-${f.id}" spellcheck="false" placeholder="default"
+        value="${escHtml(draftFeat[f.id].model)}" title="Model name — pick from the list or type your own; blank = NEO’s default"/>
+      <datalist id="ai-dl-${f.id}"></datalist>
+    </div>`).join('');
+  const provRowHtml = (id, p) => `
+    <div class="stats-row ai-prov" data-id="${id}">
+      <input class="ai-pr-name" spellcheck="false" value="${escHtml(p.name)}" title="Display name"/>
+      <input class="ai-pr-base" spellcheck="false" value="${escHtml(p.baseUrl)}" placeholder="https://… or http://localhost:11434/v1" title="OpenAI-compatible base URL (http is fine for local engines like Ollama or LM Studio)"/>
+      <span class="ai-pr-key soft" data-id="${id}">checking…</span>
+      <button class="ai-pr-keybtn btn-quiet">Key…</button>
+      <button class="ai-pr-models btn-quiet" title="Pull the model list from this provider">↻ Models</button>
+      <span class="ai-pr-nmodels soft"></span>
+      ${id !== 'openai' ? '<button class="ai-pr-del btn-quiet" title="Remove provider">✕</button>' : ''}
+    </div>`;
+  const CLOUD_PRESETS = [
+    { id: 'openai', name: 'OpenAI', baseUrl: DEFAULT_BASE, where: 'platform.openai.com → API keys' },
+    { id: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', where: 'openrouter.ai → Keys — one key, every big model' },
+    { id: 'xai', name: 'xAI (Grok)', baseUrl: 'https://api.x.ai/v1', where: 'console.x.ai → API keys' },
+    { id: 'together', name: 'Together', baseUrl: 'https://api.together.xyz/v1', where: 'api.together.ai → API keys' }
+  ];
+  bd.innerHTML = `
+    <div class="modal" style="width:580px">
+      <h2 style="font-size:17px">AI Setup</h2>
+      <p class="ai-now soft"></p>
+      ${window.neo.pocket ? '' : `
+      <div class="ai-paths">
+        <button class="ai-path" data-path="local">
+          <strong>Free &amp; private — on this computer</strong>
+          <span>NEO installs a local engine and picks a model that fits your machine. No account, no key, works offline.</span>
+          <em>Recommended — guided, a few minutes</em>
+        </button>
+        <button class="ai-path" data-path="cloud">
+          <strong>Cloud — bring an API key</strong>
+          <span>OpenAI, OpenRouter, xAI, Together… the strongest models, pay per use.</span>
+        </button>
+      </div>
+      <div class="ai-cloud-pick" ${path === 'cloud' ? '' : 'hidden'}>
+        ${CLOUD_PRESETS.map((p) => `<button class="fr-choice ai-preset" data-id="${p.id}"><strong>${p.name}</strong><span>${p.where}</span></button>`).join('')}
+        <button class="fr-choice ai-preset" data-id="custom"><strong>Custom…</strong><span>Any OpenAI-compatible endpoint — Ollama, LM Studio, your own server</span></button>
+      </div>`}
+      <details class="ai-advanced">
+        <summary class="soft">Advanced — providers &amp; per-feature models</summary>
+        <p class="soft" style="font-size:12px">One key per provider, stored encrypted on this computer, never in your library. NEO pulls each provider’s model list (↻ Models, or automatically when a key is present) so you can pick instead of guessing names. Blank means NEO’s default.</p>
+        <h3 class="ai-h">Providers (OpenAI-compatible)</h3>
+        <div class="ai-prov-list">${Object.entries(draft).map(([id, p]) => provRowHtml(id, p)).join('')}</div>
+        <div style="margin:0 0 12px"><button class="ai-add-prov btn-quiet">+ Add provider</button></div>
+        <h3 class="ai-h">Models per feature</h3>
+        ${featRows}
+        <p class="soft" style="font-size:12px">Covers keep their own Brief/Paint models under File → Cover Art… — the provider there follows this list.</p>
+      </details>
+      <div style="text-align:right;margin-top:14px">
+        <button class="m-cancel btn-quiet" style="margin-right:10px">Cancel</button>
+        <button class="m-ok btn-gold">Save</button>
+      </div>
+    </div>`;
+  document.body.appendChild(bd);
+
+  const statusLine = () => {
+    const names = [];
+    let model = '';
+    for (const f of AI_FEATURES) {
+      const d = draftFeat[f.id];
+      const p = draft[d.provider] || { name: d.provider };
+      if (!names.includes(p.name)) names.push(p.name);
+      if (!model && d.model) model = d.model;
+    }
+    const el = bd.querySelector('.ai-now');
+    if (el) el.textContent = `Currently: ${names.join(' + ')}${model ? ' · ' + model : ''} — placeholders, continuity, synopsis and rewrites all use it.`;
+  };
+  statusLine();
+  if (!window.neo.pocket) {
+    bd.querySelectorAll('.ai-path').forEach((card) => {
+      card.onclick = () => {
+        if (card.dataset.path === 'local') { close(); runLocalAiWizard(); }
+        else {
+          const pick = bd.querySelector('.ai-cloud-pick');
+          pick.hidden = !pick.hidden;
+        }
+      };
+    });
+    const useCloudPreset = async (p) => {
+      let id = p.id, name = p.name, baseUrl = p.baseUrl;
+      if (p.id === 'custom') {
+        name = await askInput('Provider name', 'e.g. My engine', '');
+        if (!name) return;
+        for (;;) {
+          const u = await askInput(`Base URL — ${name}`, 'https://… or http://localhost:11434/v1', '');
+          if (u == null) return;
+          try { if (new URL(u).hostname) { baseUrl = u; break; } } catch { /* ask again */ }
+          toast('That doesn’t look like a URL — try again', 5000);
+        }
+        id = 'custom-' + Date.now().toString(36);
+      }
+      if (!draft[id]) addProviderRow(id, { name, baseUrl });
+      bd.querySelector('.ai-advanced').open = true;
+      const placeholder = p.id === 'custom'
+        ? 'paste key — leave blank for local engines'
+        : `paste key (${p.where})`;
+      const v = await askInput(`API key — ${name}`, placeholder, '');
+      if (v == null) return;
+      if (v === 'remove') await window.neo.setSecret(id, '');
+      else if (v && /^\S{20,}$/.test(v.trim())) await window.neo.setSecret(id, v.trim());
+      else if (v) { toast('That doesn’t look like a key — not saved', 5000); return; }
+      await refreshBadge(id);
+      if (await window.neo.hasSecret(id)) fetchModels(id);
+    };
+    bd.querySelectorAll('.ai-preset').forEach((b) => {
+      b.onclick = () => useCloudPreset(CLOUD_PRESETS.find((x) => x.id === b.dataset.id) || { id: 'custom' });
+    });
+  }
+
+  // Fill each feature's model suggestions from the selected provider's list.
+  const refreshDatalists = () => {
+    bd.querySelectorAll('.ai-feat').forEach((row) => {
+      const dl = row.querySelector('datalist');
+      const names = modelCache[row.querySelector('.ai-f-prov').value] || [];
+      dl.innerHTML = names.map((n) => `<option value="${escHtml(n)}">`).join('');
+    });
+  };
+  // Pull /models for one provider using the base URL currently in its row.
+  const fetchModels = async (id) => {
+    const row = bd.querySelector(`.ai-prov[data-id="${id}"]`);
+    if (!row) return;
+    const base = row.querySelector('.ai-pr-base').value.trim() || DEFAULT_BASE;
+    const nEl = row.querySelector('.ai-pr-nmodels');
+    const rowLocal = !!(draft[id] && draft[id].local) || aiIsLocalUrl(base);
+    if (!rowLocal && !(await window.neo.hasSecret(id))) { nEl.textContent = 'add a key first'; return; }
+    nEl.textContent = 'fetching…';
+    const res = await window.neo.aiModels(base, id);
+    if (res && !res.error && res.models && res.models.length) {
+      modelCache[id] = res.models;
+      nEl.textContent = `${res.models.length} models`;
+    } else {
+      nEl.textContent = (res && res.error) ? 'fetch failed' : 'no models found';
+    }
+    refreshDatalists();
+  };
+  const refreshBadge = async (id) => {
+    const badge = bd.querySelector(`.ai-pr-key[data-id="${id}"]`);
+    if (!badge) return;
+    if (draft[id] && draft[id].local) { badge.textContent = '● local — no key needed'; return; }
+    badge.textContent = await window.neo.hasSecret(id) ? '● key saved' : '○ no key';
+  };
+  const wireProvRow = (row) => {
+    const id = row.dataset.id;
+    row.querySelector('.ai-pr-keybtn').onclick = async () => {
+      const v = await askInput(`API key — ${(draft[id] && draft[id].name) || id}`, 'paste key, or type “remove”', '');
+      if (v == null) return;
+      if (v === 'remove') await window.neo.setSecret(id, '');
+      else if (v && /^\S{20,}$/.test(v.trim())) await window.neo.setSecret(id, v.trim());
+      else if (v) { toast('That doesn’t look like a key — not saved', 5000); return; }
+      await refreshBadge(id);
+      // a fresh key means a fresh model list
+      if (await window.neo.hasSecret(id)) fetchModels(id);
+      else { modelCache[id] = []; row.querySelector('.ai-pr-nmodels').textContent = ''; refreshDatalists(); }
+    };
+    row.querySelector('.ai-pr-models').onclick = () => fetchModels(id);
+    const del = row.querySelector('.ai-pr-del');
+    if (del) del.onclick = () => {
+      delete draft[id];
+      delete modelCache[id];
+      row.remove();
+      // drop the provider from every feature select, falling back to openai
+      bd.querySelectorAll('.ai-f-prov').forEach((sel) => {
+        [...sel.options].forEach((o) => { if (o.value === id) o.remove(); });
+        if (sel.value === id || !sel.value) sel.value = 'openai';
+      });
+      refreshDatalists();
+    };
+  };
+  bd.querySelectorAll('.ai-prov').forEach(wireProvRow);
+  // switching a feature's provider shows that provider's models (pulling first if needed)
+  bd.querySelectorAll('.ai-feat .ai-f-prov').forEach((sel) => {
+    sel.onchange = async () => {
+      const selLocal = !!(draft[sel.value] && draft[sel.value].local);
+      if (!modelCache[sel.value] && (selLocal || await window.neo.hasSecret(sel.value))) fetchModels(sel.value);
+      else refreshDatalists();
+    };
+  });
+  // key badges first, then auto-pull model lists wherever they're usable
+  (async () => {
+    for (const id of Object.keys(draft)) await refreshBadge(id);
+    for (const id of Object.keys(draft)) {
+      if ((draft[id] && draft[id].local) || await window.neo.hasSecret(id)) fetchModels(id);
+    }
+  })();
+  const addProviderRow = (id, p) => {
+    draft[id] = p;
+    const tmp = document.createElement('div');
+    tmp.innerHTML = provRowHtml(id, p);
+    const row = tmp.firstElementChild;
+    bd.querySelector('.ai-prov-list').appendChild(row);
+    wireProvRow(row);
+    bd.querySelectorAll('.ai-feat .ai-f-prov').forEach((sel) => {
+      const o = document.createElement('option');
+      o.value = id; o.textContent = p.name;
+      sel.appendChild(o);
+    });
+    refreshBadge(id);
+    return row;
+  };
+  bd.querySelector('.ai-add-prov').onclick = () => {
+    const row = addProviderRow('custom-' + Date.now().toString(36), { name: 'Custom', baseUrl: '' });
+    bd.querySelector('.ai-advanced').open = true;
+    row.querySelector('.ai-pr-name').focus();
+  };
+  const close = () => bd.remove();
+  bd.querySelector('.m-cancel').onclick = close;
+  bd.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } });
+  bd.querySelector('.m-ok').onclick = async () => {
+    // providers — http is fine for local engines (Ollama, LM Studio);
+    // anything with a scheme + host goes, e.g. http://localhost:11434/v1
+    for (const row of bd.querySelectorAll('.ai-prov')) {
+      const id = row.dataset.id;
+      const typed = row.querySelector('.ai-pr-base').value.trim();
+      if (!typed && id !== 'openai') { toast(`“${draft[id] ? draft[id].name : id}” needs its base URL — e.g. http://localhost:11434/v1`, 6000); return; }
+      const base = typed || DEFAULT_BASE;
+      let host = '';
+      try {
+        const u = new URL(base);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('bad scheme');
+        host = u.hostname;
+      } catch { host = ''; }
+      if (!host) { toast(`“${draft[id] ? draft[id].name : id}” needs a real URL — e.g. https://api.openai.com/v1 or http://localhost:11434/v1`, 6000); return; }
+      // a localhost base is keyless — remember that so features stop asking for one
+      const local = aiIsLocalUrl(base);
+      draft[id] = { name: row.querySelector('.ai-pr-name').value.trim() || id, baseUrl: base, ...(local ? { local: true } : {}) };
+    }
+    ai.providers = draft;
+    // per-feature routes
+    bd.querySelectorAll('.ai-feat').forEach((row) => {
+      const f = row.dataset.feat;
+      ai.features[f] = {
+        provider: row.querySelector('.ai-f-prov').value,
+        model: row.querySelector('.ai-f-model').value.trim() || undefined
+      };
+    });
+    if (library.coverArt && !ai.providers[library.coverArt.provider]) library.coverArt.provider = 'openai';
+    await window.neo.writeLibrary(library);
+    close();
+    // warn, don't block: a feature pointing at a keyless cloud provider does nothing
+    const missing = [];
+    for (const f of AI_FEATURES) {
+      const pid = ai.features[f.id].provider;
+      const pLocal = ai.providers[pid] && ai.providers[pid].local;
+      if (!pLocal && !await window.neo.hasSecret(pid)) missing.push(f.label);
+    }
+    toast(missing.length ? `Saved — but no key for ${missing.join(', ')} yet.` : 'AI settings saved', 5000);
+    if (book) renderStickies();
+  };
+}
+
+/* ================================================================== */
+/*  GUIDED LOCAL AI — the wizard behind "Free & private".              */
+/*  Hardware → Ollama (installed if missing) → model that fits → pull. */
+/* ================================================================== */
+
+function runLocalAiWizard() {
+  if (window.neo.pocket) { toast('Local AI setup needs the desktop app'); return; }
+  let unsub = null;   // ollama:event listener
+  let det = null;     // detect result (hardware + suggestions)
+  let chosen = null;  // picked model
+  let pulling = false;
+  const bd = document.createElement('div');
+  bd.className = 'modal-backdrop';
+  bd.innerHTML = `
+    <div class="modal ai-wiz" style="width:480px">
+      <h2 style="font-size:17px">Local AI, made easy</h2>
+      <div class="ai-wstep" data-step="1">
+        <p>NEO will set up a small AI engine (<button class="ai-link" data-url="https://ollama.com">Ollama</button>) on this computer, then help you pick a model that fits it. Free, private, works offline — no account, no key.</p>
+        <p class="soft" style="font-size:12px">Everything text-AI in NEO can run this way: sticky brainstorms, continuity checks, blurbs &amp; synopses, rewrites. Painted covers still need an OpenAI key — that’s image work.</p>
+        <p class="ai-hw soft">Looking at your computer…</p>
+        <p class="ai-verdict soft" style="font-size:12px"></p>
+        <div class="ai-actions"><button class="aw-cancel btn-quiet">Cancel</button><button class="aw-next btn-gold" disabled>Continue</button></div>
+      </div>
+      <div class="ai-wstep" data-step="2" hidden>
+        <h3>Ollama — the engine</h3>
+        <p class="aw-status soft">Checking…</p>
+        <div class="ai-progress" hidden><span></span></div>
+        <p class="aw-note soft" style="font-size:12px"></p>
+        <div class="ai-actions"><button class="aw-cancel btn-quiet">Cancel</button><button class="aw-next btn-gold" disabled>Continue</button></div>
+      </div>
+      <div class="ai-wstep" data-step="3" hidden>
+        <h3>Pick a model</h3>
+        <p class="aw-verdict soft" style="font-size:12px"></p>
+        <div class="ai-model-cards"></div>
+        <div class="ai-actions">
+          <button class="aw-smaller btn-quiet" hidden>Show smaller options</button>
+          <span style="flex:1"></span>
+          <button class="aw-cancel btn-quiet">Cancel</button>
+          <button class="aw-next btn-gold" disabled>Download model</button>
+        </div>
+      </div>
+      <div class="ai-wstep" data-step="4" hidden>
+        <h3>Downloading the model</h3>
+        <p class="aw-status soft">Starting…</p>
+        <div class="ai-progress"><span></span></div>
+        <p class="soft" style="font-size:12px">A one-time download — you can keep writing meanwhile (“Hide” below).</p>
+        <div class="ai-actions">
+          <button class="aw-cancel btn-quiet">Cancel download</button>
+          <button class="aw-hide btn-quiet">Hide — continue in background</button>
+        </div>
+      </div>
+      <div class="ai-wstep" data-step="5" hidden>
+        <h3>Ready</h3>
+        <p class="aw-test soft">Saying hello to the model…</p>
+        <div class="ai-actions"><button class="aw-done btn-gold">Start writing</button></div>
+      </div>
+    </div>`;
+  document.body.appendChild(bd);
+  const stepEl = (n) => bd.querySelector(`.ai-wstep[data-step="${n}"]`);
+  const step = (n) => { bd.querySelectorAll('.ai-wstep').forEach((s) => { s.hidden = s.dataset.step !== String(n); }); };
+  const bar = (wrap, pct) => {
+    if (!wrap) return;
+    wrap.hidden = false;
+    const fill = wrap.querySelector('span');
+    if (fill) fill.style.width = Math.max(2, Math.min(100, pct || 0)) + '%';
+  };
+  const finish = () => { if (unsub) { unsub(); unsub = null; } bd.remove(); if (book) renderStickies(); };
+  const cancelWizard = async () => { if (pulling) await window.neo.ollamaCancel(); finish(); };
+  const s2 = stepEl(2), s3 = stepEl(3), s4 = stepEl(4), s5 = stepEl(5);
+
+  // links open outside the writing room
+  bd.querySelectorAll('.ai-link').forEach((a) => {
+    a.onclick = () => window.neo.openUrl(a.dataset.url);
+  });
+
+  // one listener for both long jobs (install + pull); quiet once hidden
+  unsub = window.neo.onOllamaEvent((ev) => {
+    if (!bd.isConnected) return;
+    if (ev.type === 'download' && !s2.hidden) {
+      s2.querySelector('.aw-status').textContent = `Downloading Ollama… ${ev.mb}${ev.mbTotal ? ' of ' + ev.mbTotal : ''} MB`;
+      bar(s2.querySelector('.ai-progress'), ev.pct);
+    } else if ((ev.type === 'note' || ev.type === 'wait') && !s2.hidden) {
+      s2.querySelector('.ai-progress').hidden = true;
+      s2.querySelector('.aw-status').textContent = ev.text;
+    } else if (ev.type === 'ready' && !s2.hidden) {
+      s2.querySelector('.ai-progress').hidden = true;
+      s2.querySelector('.aw-status').textContent = 'Ollama is running ✓';
+      s2.querySelector('.aw-note').textContent = ev.already ? 'Already installed — nothing to do.' : 'Installed and running.';
+      s2.querySelector('.aw-next').disabled = false;
+    } else if (ev.type === 'pull' && !s4.hidden && chosen) {
+      if (ev.pct != null && ev.pct < 100) {
+        s4.querySelector('.aw-status').textContent = `Downloading ${chosen.tag}… ${ev.pct}%${ev.gbTotal ? ` (${ev.gbDone || 0} of ${ev.gbTotal} GB)` : ''}`;
+        bar(s4.querySelector('.ai-progress'), ev.pct);
+      } else if (ev.status && ev.status !== 'success') {
+        s4.querySelector('.aw-status').textContent = ev.status;
+      }
+    }
+  });
+
+  /* step 1 — what is this machine? */
+  (async () => {
+    det = await window.neo.ollamaDetect();
+    if (!bd.isConnected) return;
+    const hwEl = bd.querySelector('.ai-hw');
+    if (!det || det.error || !det.hw || !det.hw.ramGB) {
+      hwEl.textContent = 'Couldn’t quite read this machine — safe choices below.';
+    } else {
+      const hw = det.hw;
+      const bits = [];
+      if (hw.gpu && hw.gpu.name) {
+        bits.push(hw.gpu.name + (hw.gpu.vramMB ? ` · ${Math.round(hw.gpu.vramMB / 1024)} GB video memory` : (hw.appleSilicon ? ' · shared memory' : '')));
+      }
+      bits.push(`${hw.ramGB} GB RAM`);
+      hwEl.textContent = `Your computer: ${bits.join(' · ')}`;
+    }
+    bd.querySelector('.ai-verdict').textContent = (det && det.verdict) || '';
+    stepEl(1).querySelector('.aw-next').disabled = false;
+  })();
+
+  /* step 2 — bring Ollama up (installing it if missing) */
+  async function startSetup() {
+    const st = s2.querySelector('.aw-status');
+    const note = s2.querySelector('.aw-note');
+    st.textContent = 'Checking for Ollama…';
+    note.textContent = '';
+    const res = await window.neo.ollamaSetup();
+    if (!bd.isConnected) return;
+    if (res && res.ok) {
+      s2.querySelector('.ai-progress').hidden = true;
+      st.textContent = 'Ollama is running ✓';
+      note.textContent = res.alreadyRunning ? 'Already installed — nothing to do.' : 'Installed and running.';
+      s2.querySelector('.aw-next').disabled = false;
+    } else {
+      st.textContent = '';
+      note.textContent = (res && res.error) || 'Something went wrong.';
+      const link = document.createElement('button');
+      link.className = 'ai-link';
+      link.textContent = 'Open ollama.com/download';
+      link.onclick = () => window.neo.openUrl('https://ollama.com/download');
+      note.appendChild(document.createTextNode(' '));
+      note.appendChild(link);
+      const retry = document.createElement('button');
+      retry.className = 'btn-quiet';
+      retry.style.marginLeft = '10px';
+      retry.textContent = 'Try again';
+      retry.onclick = () => { retry.remove(); startSetup(); };
+      note.appendChild(retry);
+    }
+  }
+
+  /* step 3 — model cards that fit the machine */
+  function buildModelCards(smaller = false) {
+    const safe = [
+      { tag: 'llama3.2:3b', sizeGB: 2.0, blurb: 'Small and quick — a safe choice for any machine.' },
+      { tag: 'qwen3:4b', sizeGB: 2.5, blurb: 'Compact all-rounder, snappy with rewrites.' }
+    ];
+    const mainList = (det && det.models && det.models.length) ? det.models : safe;
+    const smallList = (det && det.smaller && det.smaller.length) ? det.smaller : [];
+    const list = (smaller && smallList.length) ? smallList : mainList;
+    chosen = list[0] || null;
+    s3.querySelector('.aw-verdict').textContent = (det && det.verdict) || '';
+    s3.querySelector('.ai-model-cards').innerHTML = list.map((m, i) => `
+      <button class="fr-choice ai-model-card${i === 0 ? ' sel' : ''}" data-tag="${escHtml(m.tag)}">
+        <strong><span class="mm-tag">${escHtml(m.tag)}</span><span class="mm-size">${m.sizeGB} GB</span></strong>
+        <span>${escHtml(m.blurb)}</span>
+      </button>`).join('');
+    s3.querySelectorAll('.ai-model-card').forEach((card) => {
+      card.onclick = () => {
+        s3.querySelectorAll('.ai-model-card').forEach((c) => c.classList.remove('sel'));
+        card.classList.add('sel');
+        chosen = list.find((m) => m.tag === card.dataset.tag) || chosen;
+      };
+    });
+    s3.querySelector('.aw-next').disabled = !chosen;
+    const smBtn = s3.querySelector('.aw-smaller');
+    smBtn.hidden = !smallList.length || smaller;
+    if (!smBtn.hidden) smBtn.onclick = () => buildModelCards(true);
+  }
+
+  /* step 4 — write the route up front, then pull */
+  async function startPull() {
+    if (!chosen) return;
+    // Writing the route before the download means an interrupted pull still
+    // leaves a consistent setup: features point at Ollama, the model re-pulls.
+    const ai = aiConf();
+    ai.providers.ollama = { name: 'Ollama (this computer)', baseUrl: 'http://localhost:11434/v1', local: true };
+    for (const f of AI_FEATURES) ai.features[f.id] = { provider: 'ollama', model: chosen.tag };
+    await window.neo.writeLibrary(library);
+    await doPull();
+  }
+  async function doPull() {
+    pulling = true;
+    s4.querySelector('.aw-status').textContent = `Downloading ${chosen.tag}…`;
+    const res = await window.neo.ollamaPull(chosen.tag);
+    pulling = false;
+    if (!bd.isConnected) { // hidden — finish quietly
+      if (res && res.ok) toast(`${chosen.tag} is ready — local AI is set up`, 6000);
+      if (unsub) { unsub(); unsub = null; }
+      if (book) renderStickies();
+      return;
+    }
+    if (res && res.ok) { step(5); runSmokeTest(); }
+    else if (res && res.error === 'cancelled') { finish(); }
+    else {
+      const st = s4.querySelector('.aw-status');
+      st.textContent = (res && res.error) || 'The download failed.';
+      const retry = document.createElement('button');
+      retry.className = 'btn-quiet';
+      retry.style.marginLeft = '10px';
+      retry.textContent = 'Try again';
+      retry.onclick = () => { retry.remove(); doPull(); };
+      st.appendChild(document.createTextNode(' '));
+      st.appendChild(retry);
+    }
+  }
+
+  /* step 5 — one live round-trip so “ready” means ready */
+  async function runSmokeTest() {
+    const t = s5.querySelector('.aw-test');
+    const res = await window.neo.aiChat('global', 'setup', {
+      provider: 'ollama', baseUrl: 'http://localhost:11434/v1', model: chosen.tag,
+      messages: [{ role: 'user', content: 'Reply with exactly: OK' }], maxTokens: 500
+    });
+    if (!bd.isConnected) return;
+    if (res && res.text) t.textContent = `✓ ${chosen.tag} answered — local AI is ready. Everything runs on this machine.`;
+    else t.textContent = 'The model is installed, but the test call failed — it may still be loading. Give it a moment, then try a feature like the sticky ✦ brainstorm.';
+  }
+
+  bd.querySelectorAll('.aw-cancel').forEach((b) => { b.onclick = cancelWizard; });
+  bd.addEventListener('keydown', (e) => { if (e.key === 'Escape') { e.stopPropagation(); cancelWizard(); } });
+  bd.querySelectorAll('.aw-next').forEach((btn) => {
+    btn.onclick = () => {
+      const cur = btn.closest('.ai-wstep').dataset.step;
+      if (cur === '1') {
+        // already running? the engine step would only say "✓ nothing to do"
+        if (det && det.running) { step(3); buildModelCards(); }
+        else { step(2); startSetup(); }
+      } else if (cur === '2') { step(3); buildModelCards(); }
+      else if (cur === '3') { step(4); startPull(); }
+    };
+  });
+  s4.querySelector('.aw-hide').onclick = () => bd.remove(); // pull + listener carry on
+  s5.querySelector('.aw-done').onclick = () => {
+    finish();
+    toast('Local AI is ready — the ✦ features now run on this computer', 6000);
+  };
+}
+
+/* The gentle "want AI?" card: on missing keys and after first run. */
+let aiOfferOpen = false;
+function aiOfferModal() {
+  if (aiOfferOpen || window.neo.pocket) return Promise.resolve(null);
+  aiOfferOpen = true;
+  return optionModal('Want AI help while writing?', 'Brainstorm placeholders, check continuity, tune a sentence — set it up once and it’s one keystroke away.', [
+    { label: 'Set up local AI — free & private', desc: 'Runs on this computer. No account, no key.', value: 'local' },
+    { label: 'Use an API key', desc: 'OpenAI and friends — the strongest models, pay per use.', value: 'cloud' },
+    { label: 'Maybe later', value: null }
+  ]).then((pick) => { aiOfferOpen = false; return pick; });
+}
+
+// One-time offer after the first-run wizard; latched so it never nags.
+async function offerAiSetupOnce() {
+  if (window.neo.pocket || library.aiOfferDone) return;
+  const providers = aiProviders();
+  if (Object.values(providers).some((p) => p && p.local)) return;
+  for (const id of Object.keys(providers)) {
+    if (await window.neo.hasSecret(id)) return; // already configured
+  }
+  const pick = await aiOfferModal();
+  library.aiOfferDone = true;
+  await window.neo.writeLibrary(library);
+  if (pick) openAiSetup(pick);
+}
+
+/* Pacing & momentum (local-only, no AI key): per-chapter shape + dialogue mix. */
+function pacingRows() {
+  if (!book) return [];
+  return book.chapterOrder.map((chId, i) => {
+    const text = chapterText(chId);
+    const words = countWords(text);
+    const quotes = (text.match(/"[^"]+"|“[^”]+”/g) || []).join(' ');
+    const dlgWords = countWords(quotes);
+    const sentences = text.split(/[.!?…]+/).map((s) => s.trim()).filter(Boolean);
+    const avgSent = sentences.length ? Math.round(words / sentences.length) : 0;
+    return { chId, idx: i + 1, words, dlgPct: words ? Math.round((dlgWords / words) * 100) : 0, avgSent };
+  });
+}
+function pacingHtml() {
+  if (!book || !book.chapterOrder.length) return '';
+  const rows = pacingRows();
+  const maxW = Math.max(...rows.map((r) => r.words), 1);
+  const bars = rows.slice(0, 30).map((r) =>
+    `<div class="pace-row"><span class="pace-ch">Ch ${r.idx}</span>
+     <span class="pace-bar"><span style="width:${Math.round((r.words / maxW) * 100)}%"></span></span>
+     <span class="pace-n">${r.words.toLocaleString()}w · ${r.dlgPct}% dlg · ${r.avgSent}w/sent</span></div>`
+  ).join('');
+  const more = rows.length > 30 ? `<p class="soft" style="font-size:11px">+ ${rows.length - 30} more chapters</p>` : '';
+  return `<details class="st-advanced" open><summary class="soft">Pacing — per chapter (local, no AI)</summary>
+    <div class="pace-list">${bars}</div>${more}</details>`;
+}
+
 function openStats() {
   const hasBook = !!book;
   const today = hasBook ? (book.dailyCounts || {})[todayStr()] : null;
@@ -3926,7 +5045,8 @@ function openStats() {
         <div><div class="big">${wordsToday.toLocaleString()}</div><div class="lbl">today</div></div>
         <div><div class="big">${book.wordGoal ? Math.min(100, Math.round(total / book.wordGoal * 100)) + '%' : '—'}</div><div class="lbl">of book goal</div></div>
       </div>
-      ${statsChartSvg()}` : ''}
+      ${statsChartSvg()}
+      ${pacingHtml()}` : ''}
       <div class="stats-row" style="margin-top:18px">
         <label>Daily goal <input id="st-daily" type="number" min="0" value="${library.dailyGoal || ''}" placeholder="500"/></label>
         ${hasBook ? `<label>Book goal <input id="st-book" type="number" min="0" value="${book.wordGoal || ''}" placeholder="80000"/></label>` : ''}
@@ -4837,6 +5957,7 @@ window.neo.onMenu(async (msg) => {
   if (msg.type === 'import') importBooks();
   if (msg.type === 'stats') openStats();
   if (msg.type === 'coverArt') openCoverArt();
+  if (msg.type === 'writingAssistant') NeoWritingAssistant.openSettings();
   if (msg.type === 'align') {
     applyAlign(msg.value);
   }

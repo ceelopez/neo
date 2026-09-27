@@ -176,6 +176,15 @@
     hasSecret: async () => false,
     setSecret: async () => false,
     paintCover: async () => { throw new Error('Cover painting happens on the desktop'); },
+    aiChat: async () => ({ error: 'AI happens on the desktop' }),
+    aiModels: async () => ({ models: [] }),
+    ollamaDetect: async () => ({ hw: { platform: 'pocket' }, running: false, models: [], smaller: [], error: 'Desktop only' }),
+    ollamaSetup: async () => ({ ok: false, error: 'Desktop only' }),
+    ollamaPull: async () => ({ ok: false, error: 'Desktop only' }),
+    ollamaCancel: async () => true,
+    deleteRetiredJSON: async () => true,
+    openUrl: async () => false,
+    pocket: true,
 
     /* ---------- covers: shown if present, managed on the Mac ---------- */
     readCover: async (bookId, fname) => {
@@ -214,6 +223,7 @@
       showErrorDetail(msg);
     },
     onMenu: () => { /* no menu bar in your pocket */ },
+    onOllamaEvent: () => () => { /* no local engines in a pocket */ },
     poetryState: () => { /* no Format menu to tick */ }
   };
 
